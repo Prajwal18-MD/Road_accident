@@ -1,0 +1,11 @@
+{
+  "latitude": 12.9716,
+  "longitude": 77.5946,
+  "time_of_day": 14,
+  "day_of_week": 1,
+  "weather": "Clear",
+  "road_type": "Highway",
+  "speed_limit": 60,
+  "traffic_level": "Medium",
+  "past_accidents": 5
+}

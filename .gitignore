@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+venv/
+env/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data & Models
+model.joblib
+# We do not ignore the input CSV as it is part of the user's starting point,
+# but typically massive datasets should be ignored.
+# accident_prediction_india.csv
+
+# IDEs
+.vscode/
+.idea/
