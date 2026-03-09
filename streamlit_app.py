@@ -12,6 +12,7 @@ import folium
 from streamlit_folium import st_folium
 import json
 import os
+import streamlit.components.v1 as components
 
 # Import custom modules
 from safety_scorer import SafetyScorer
@@ -385,6 +386,38 @@ if pipeline is None:
     st.stop()
 
 # -------------------------------------------------------------------------
+# Historical Accident Count by City (from CSV)
+# -------------------------------------------------------------------------
+@st.cache_data
+def get_city_accident_counts(csv_path: str):
+    """Returns a dict of {city_name_lower: count} from the accident CSV."""
+    if not os.path.exists(csv_path):
+        return {}
+    df = pd.read_csv(csv_path)
+    col = 'City Name' if 'City Name' in df.columns else None
+    if col is None:
+        return {}
+    counts = df[col].str.strip().str.lower().value_counts().to_dict()
+    return counts
+
+city_accident_counts = get_city_accident_counts(ACCIDENT_DATA)
+
+def get_historical_count_for_place(place_name: str) -> tuple:
+    """Fuzzy-match a place name against city accident counts.
+    Returns (matched_city, count) or (None, 0)."""
+    if not place_name or not city_accident_counts:
+        return (None, 0)
+    query = place_name.strip().lower()
+    # Exact match first
+    if query in city_accident_counts:
+        return (query.title(), city_accident_counts[query])
+    # Substring match
+    for city, cnt in city_accident_counts.items():
+        if query in city or city in query:
+            return (city.title(), cnt)
+    return (None, 0)
+
+# -------------------------------------------------------------------------
 # Premium Statistics Dashboard Header
 # -------------------------------------------------------------------------
 st.markdown("""
@@ -495,6 +528,19 @@ if 'recommendation_results' not in st.session_state:
     st.session_state.recommendation_results = None
 if 'emergency_results' not in st.session_state:
     st.session_state.emergency_results = None
+# Geo-resolved coordinates from place name or live GPS
+if 'resolved_lat' not in st.session_state:
+    st.session_state.resolved_lat = 12.9716
+if 'resolved_lon' not in st.session_state:
+    st.session_state.resolved_lon = 77.5946
+if 'resolved_place' not in st.session_state:
+    st.session_state.resolved_place = ""
+if 'emergency_lat' not in st.session_state:
+    st.session_state.emergency_lat = 12.9716
+if 'emergency_lon' not in st.session_state:
+    st.session_state.emergency_lon = 77.5946
+if 'emergency_place' not in st.session_state:
+    st.session_state.emergency_place = ""
 
 # -------------------------------------------------------------------------
 # Enhanced Sidebar
@@ -585,46 +631,143 @@ if tab_selection == "🔍 Risk Prediction":
     with col_input:
         st.subheader("📍 Input Parameters")
         
-        # Location
-        st.markdown("**Location**")
+        # ── Location via Place Name or Live GPS ──────────────────────────
+        st.markdown("**📍 Location**")
+        place_name = st.text_input(
+            "Place name",
+            placeholder="e.g. Connaught Place, Delhi or MG Road, Bangalore",
+            help="Type any address, landmark, or city. We'll look up its coordinates automatically."
+        )
+
+        # Live Location button via injected HTML/JS
+        st.markdown("""
+        <style>
+        .live-btn {
+            display:inline-block; padding:8px 16px;
+            background:linear-gradient(135deg,#4facfe,#00f2fe);
+            color:#0a0e27; border-radius:8px; font-weight:600;
+            font-size:0.85rem; cursor:pointer; border:none;
+            margin-bottom:8px;
+        }
+        .live-btn:hover{opacity:0.85;}
+        </style>
+        """, unsafe_allow_html=True)
+
+        # Hidden text field receives the GPS coords from JS
+        gps_coords_raw = st.text_input(
+            "_gps_hidden", value="", label_visibility="collapsed",
+            key="gps_input_risk",
+            placeholder="GPS coords will appear here after clicking below"
+        )
+
+        components.html("""
+        <button class="live-btn" onclick="getLocation()"
+          style="padding:9px 18px;background:linear-gradient(135deg,#4facfe,#00f2fe);
+                 color:#0a0e27;border-radius:8px;font-weight:700;font-size:0.9rem;
+                 cursor:pointer;border:none;font-family:Inter,sans-serif;">
+            📍 Use My Live Location
+        </button>
+        <div id="status" style="font-size:0.78rem;color:#b4b9d4;margin-top:4px;"></div>
+        <script>
+        function getLocation(){
+          var s=document.getElementById('status');
+          if(!navigator.geolocation){s.innerText='Geolocation not supported.';return;}
+          s.innerText='Detecting location...';
+          navigator.geolocation.getCurrentPosition(
+            function(pos){
+              var lat=pos.coords.latitude.toFixed(6);
+              var lon=pos.coords.longitude.toFixed(6);
+              // Write into the Streamlit hidden input
+              var inputs=window.parent.document.querySelectorAll('input[data-testid="stTextInput"]');
+              for(var i=0;i<inputs.length;i++){
+                if(inputs[i].placeholder && inputs[i].placeholder.includes('GPS coords')){
+                  var nativeInputValueSetter=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
+                  nativeInputValueSetter.call(inputs[i],lat+','+lon);
+                  inputs[i].dispatchEvent(new Event('input',{bubbles:true}));
+                  break;
+                }
+              }
+              s.innerText='📍 Got location: '+lat+', '+lon+' — now click Analyze Risk';
+            },
+            function(err){s.innerText='Error: '+err.message;}
+          );
+        }
+        </script>
+        """, height=80)
+
+        # Parse GPS from hidden field if populated
+        if gps_coords_raw and ',' in gps_coords_raw:
+            try:
+                _parts = gps_coords_raw.strip().split(',')
+                st.session_state.resolved_lat = float(_parts[0])
+                st.session_state.resolved_lon = float(_parts[1])
+                st.session_state.resolved_place = f"Live GPS ({_parts[0][:7]}, {_parts[1][:7]})"
+                st.markdown(
+                    f"<div style='color:#4facfe;font-size:0.82rem;'>📍 Live location: "
+                    f"{st.session_state.resolved_lat:.4f}, {st.session_state.resolved_lon:.4f}</div>",
+                    unsafe_allow_html=True
+                )
+            except:
+                pass
+        elif st.session_state.resolved_place and not place_name:
+            st.markdown(
+                f"<div style='color:#4facfe;font-size:0.82rem;'>📍 Using: {st.session_state.resolved_place} "
+                f"({st.session_state.resolved_lat:.4f}, {st.session_state.resolved_lon:.4f})</div>",
+                unsafe_allow_html=True
+            )
+
+        st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+
+        # Road / location type
         known_areas = list(loc_counts.keys()) if loc_counts else ["Other"]
-        area = st.selectbox("Area / Road Name", options=known_areas)
-        
-        col_lat, col_lon = st.columns(2)
-        with col_lat:
-            lat = st.number_input("Latitude", value=12.9716, format="%.4f")
-        with col_lon:
-            lon = st.number_input("Longitude", value=77.5946, format="%.4f")
-        
+        area = st.selectbox("Road / Location Type", options=known_areas)
+
         # Time
-        st.markdown("**Time**")
+        st.markdown("**⏰ Time**")
         time_val = st.time_input("Time of Day", pd.to_datetime("14:30").time())
-        day_val = st.selectbox("Day of Week", 
+        day_val = st.selectbox("Day of Week",
                                ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"])
-        
+
         # Road Conditions
-        st.markdown("**Road Conditions**")
+        st.markdown("**🛣️ Road Conditions**")
         road_type = st.selectbox("Road Type", ["Single carriageway", "Dual carriageway", "Roundabout", "One way", "Highway"])
         speed_limit = st.slider("Speed Limit (km/h)", 20, 120, 50)
         traffic_level = st.select_slider("Traffic Level", options=["Low", "Medium", "High"])
-        
+
         # Weather
-        st.markdown("**Weather**")
-        weather = st.selectbox("Weather Condition", 
+        st.markdown("**🌤️ Weather**")
+        weather = st.selectbox("Weather Condition",
                                ["Fine", "Raining", "Raining and Windy", "Fog or Mist", "Other"])
-        
-        # Past Accidents
+
+        # Past Accidents auto-filled from loc_counts
         default_past = loc_counts.get(area, 0)
-        past_accidents = st.number_input("Historical Accident Count", min_value=0, value=default_past)
-        
+        past_accidents = st.number_input("Historical Accident Count (location type)", min_value=0, value=default_past)
+
         analyze_btn = st.button("🔍 Analyze Risk", use_container_width=True)
     
     # Process if button clicked
     if analyze_btn:
+        # ── Geocode the place name if provided ──────────────────────────
+        if place_name and place_name.strip():
+            with st.spinner("🔍 Looking up location..."):
+                coords = geocode_address(place_name.strip())
+            if coords:
+                st.session_state.resolved_lat, st.session_state.resolved_lon = coords
+                st.session_state.resolved_place = place_name.strip()
+            else:
+                st.warning(f"⚠️ Could not find '{place_name}'. Using last known location.")
+
+        lat = st.session_state.resolved_lat
+        lon = st.session_state.resolved_lon
+
+        # ── Compute historical accident count for the searched place ────
+        search_key = place_name.strip() if place_name and place_name.strip() else st.session_state.resolved_place
+        hist_city, hist_count = get_historical_count_for_place(search_key)
+
         hour = time_val.hour
         is_night = 1 if (hour >= 18 or hour < 6) else 0
         traffic_map = {"Low": "None", "Medium": "Give way", "High": "Traffic signal"}
-        
+
         input_data = {
             'hour': hour,
             'is_night': is_night,
@@ -650,25 +793,25 @@ if tab_selection == "🔍 Risk Prediction":
             'Number_of_vehicles_involved': 2,
             'Number of Fatalities': 0
         }
-        
+
         input_df = pd.DataFrame([input_data])
-        
+
         try:
             probs = pipeline.predict_proba(input_df)[0]
             pred_class = np.argmax(probs)
             confidence = probs[pred_class]
-            
+
             risk_labels = ["Low", "Medium", "High"]
             risk_level = risk_labels[pred_class]
-            
+
             safety_result = scorer.calculate_safety_score(
                 area, road_type, speed_limit, hour, day_val, weather, traffic_level, lat, lon
             )
-            
+
             explanation = None
             if explainer:
                 explanation = explainer.explain_prediction(input_df, top_n=5)
-            
+
             # STORE IN SESSION STATE
             st.session_state.risk_results = {
                 'risk_level': risk_level,
@@ -677,9 +820,14 @@ if tab_selection == "🔍 Risk Prediction":
                 'explanation': explanation,
                 'past_accidents': past_accidents,
                 'traffic_level': traffic_level,
-                'speed_limit': speed_limit
+                'speed_limit': speed_limit,
+                'resolved_lat': lat,
+                'resolved_lon': lon,
+                'resolved_place': st.session_state.resolved_place,
+                'hist_city': hist_city,
+                'hist_count': hist_count,
             }
-            
+
         except Exception as e:
             st.session_state.risk_results = {'error': str(e)}
     
@@ -826,11 +974,59 @@ if tab_selection == "🔍 Risk Prediction":
                     </div>
                     """, unsafe_allow_html=True)
                 
+                # ── Historical Accident Count Card ──────────────────────
+                hist_city  = results.get('hist_city')
+                hist_count = results.get('hist_count', 0)
+                resolved_place = results.get('resolved_place', '')
+
+                if hist_city and hist_count > 0:
+                    hist_color = "#fa709a" if hist_count >= 100 else "#ffc107" if hist_count >= 30 else "#00f2fe"
+                    hist_icon  = "🚨" if hist_count >= 100 else "⚠️" if hist_count >= 30 else "✅"
+                    st.markdown(f"""
+                    <div style="
+                        background: linear-gradient(135deg, rgba(79,172,254,0.08) 0%, rgba(102,126,234,0.08) 100%);
+                        padding: 18px 22px;
+                        border-radius: 12px;
+                        border-left: 4px solid {hist_color};
+                        margin-bottom: 18px;
+                        display: flex;
+                        align-items: center;
+                        gap: 16px;
+                    ">
+                        <div style="font-size:2.2rem;">{hist_icon}</div>
+                        <div>
+                            <div style="font-size:0.8rem;text-transform:uppercase;letter-spacing:0.08em;
+                                        color:#b4b9d4;font-weight:600;">Historical Accident Data</div>
+                            <div style="font-size:1.5rem;font-weight:700;color:{hist_color};
+                                        font-family:'Space Grotesk',sans-serif;">
+                                {hist_count:,} recorded accidents
+                            </div>
+                            <div style="font-size:0.85rem;color:#b4b9d4;margin-top:2px;">
+                                in <strong style="color:#ffffff;">{hist_city}</strong> from dataset
+                            </div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                elif resolved_place:
+                    st.markdown(f"""
+                    <div style="
+                        background: rgba(255,255,255,0.03);
+                        padding: 14px 18px;
+                        border-radius: 10px;
+                        border-left: 4px solid rgba(255,255,255,0.15);
+                        margin-bottom: 16px;
+                        font-size:0.88rem;
+                        color:#b4b9d4;
+                    ">
+                        📊 No historical accident data found for <strong style="color:#ffffff;">{resolved_place}</strong> in the dataset.
+                    </div>
+                    """, unsafe_allow_html=True)
+
                 # Key Metrics Row
                 st.markdown("### 📊 Key Metrics")
                 m1, m2, m3, m4 = st.columns(4)
                 with m1:
-                    st.metric("Historical Accidents", results['past_accidents'], 
+                    st.metric("Location Type Accidents", results['past_accidents'],
                              delta=None, delta_color="off")
                 with m2:
                     st.metric("Traffic Level", results['traffic_level'],
@@ -839,7 +1035,6 @@ if tab_selection == "🔍 Risk Prediction":
                     st.metric("Speed Limit", f"{results['speed_limit']} km/h",
                              delta=None, delta_color="off")
                 with m4:
-                    risk_score_delta = "⬇️ Lower is Better" if score < 50 else "⬆️ Good"
                     st.metric("Safety Index", f"{score}/100",
                              delta=None, delta_color="off")
                 
@@ -1282,30 +1477,104 @@ elif tab_selection == "🚑 Emergency Response":
     st.markdown("### Ambulance ETA Prediction for Accident Locations")
     
     col_accident, col_response = st.columns([1, 2])
-    
+
     with col_accident:
         st.subheader("🚨 Accident Location")
-        
-        accident_lat = st.number_input("Latitude", value=12.9716, format="%.4f", key="acc_lat")
-        accident_lon = st.number_input("Longitude", value=77.5946, format="%.4f", key="acc_lon")
-        
+
+        emg_place_name = st.text_input(
+            "Place name or address",
+            placeholder="e.g. Vijay Nagar, Bangalore",
+            help="Type any place name or address to locate it on the map.",
+            key="emg_place"
+        )
+
+        # Live location button for emergency tab
+        emg_gps_raw = st.text_input(
+            "_emg_gps_hidden", value="", label_visibility="collapsed",
+            key="gps_input_emergency",
+            placeholder="Emergency GPS coords"
+        )
+
+        components.html("""
+        <button onclick="getEmgLocation()"
+          style="padding:9px 18px;background:linear-gradient(135deg,#fa709a,#fee140);
+                 color:#0a0e27;border-radius:8px;font-weight:700;font-size:0.9rem;
+                 cursor:pointer;border:none;font-family:Inter,sans-serif;margin-bottom:6px;">
+            📍 Use My Live Location
+        </button>
+        <div id="emg_status" style="font-size:0.78rem;color:#b4b9d4;margin-top:4px;"></div>
+        <script>
+        function getEmgLocation(){
+          var s=document.getElementById('emg_status');
+          if(!navigator.geolocation){s.innerText='Geolocation not supported.';return;}
+          s.innerText='Detecting location...';
+          navigator.geolocation.getCurrentPosition(
+            function(pos){
+              var lat=pos.coords.latitude.toFixed(6);
+              var lon=pos.coords.longitude.toFixed(6);
+              var inputs=window.parent.document.querySelectorAll('input[data-testid="stTextInput"]');
+              for(var i=0;i<inputs.length;i++){
+                if(inputs[i].placeholder && inputs[i].placeholder.includes('Emergency GPS')){
+                  var nativeInputValueSetter=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
+                  nativeInputValueSetter.call(inputs[i],lat+','+lon);
+                  inputs[i].dispatchEvent(new Event('input',{bubbles:true}));
+                  break;
+                }
+              }
+              s.innerText='📍 Got: '+lat+', '+lon+' — click Find Hospitals';
+            },
+            function(err){s.innerText='Error: '+err.message;}
+          );
+        }
+        </script>
+        """, height=80)
+
+        # Parse emergency GPS
+        if emg_gps_raw and ',' in emg_gps_raw:
+            try:
+                _ep = emg_gps_raw.strip().split(',')
+                st.session_state.emergency_lat = float(_ep[0])
+                st.session_state.emergency_lon = float(_ep[1])
+                st.session_state.emergency_place = f"Live GPS ({_ep[0][:7]}, {_ep[1][:7]})"
+                st.markdown(
+                    f"<div style='color:#fa709a;font-size:0.82rem;'>📍 Live: "
+                    f"{st.session_state.emergency_lat:.4f}, {st.session_state.emergency_lon:.4f}</div>",
+                    unsafe_allow_html=True
+                )
+            except:
+                pass
+
         accident_hour = st.slider("Time of Accident (Hour)", 0, 23, 12)
         max_hospitals = st.slider("Max Hospitals to Show", 3, 10, 5)
         search_radius = st.slider("Search Radius (km)", 5, 50, 20)
-        
+
         find_hospitals_btn = st.button("🚑 Find Nearest Hospitals", use_container_width=True)
     
     if find_hospitals_btn:
+        # Geocode emergency place name if provided
+        if emg_place_name and emg_place_name.strip():
+            with st.spinner("🔍 Looking up location..."):
+                emg_coords = geocode_address(emg_place_name.strip())
+            if emg_coords:
+                st.session_state.emergency_lat, st.session_state.emergency_lon = emg_coords
+                st.session_state.emergency_place = emg_place_name.strip()
+            else:
+                st.warning(f"⚠️ Could not find '{emg_place_name}'. Using last known location.")
+
+        accident_lat = st.session_state.emergency_lat
+        accident_lon = st.session_state.emergency_lon
+
         with st.spinner("Locating hospitals..."):
             predictions = ambulance_predictor.predict_response_times(
                 accident_lat, accident_lon, accident_hour, max_hospitals, search_radius
             )
-            
+
             # STORE IN SESSION STATE
             st.session_state.emergency_results = {
                 'predictions': predictions,
                 'accident_lat': accident_lat,
-                'accident_lon': accident_lon
+                'accident_lon': accident_lon,
+                'location_name': st.session_state.emergency_place or f"{accident_lat:.4f}, {accident_lon:.4f}"
             }
     
     # DISPLAY FROM SESSION STATE
